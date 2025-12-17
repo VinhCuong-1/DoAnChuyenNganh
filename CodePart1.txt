@@ -1,0 +1,243 @@
+import json
+import boto3
+import time
+
+def lambda_handler(event, context):
+    """
+    PART 1: Transcribe Vietnamese -> English SRT
+    Then trigger Part 2
+    """
+    
+    source_bucket = 'demo-transcribe-s3-1'
+    
+    try:
+        print("🚀 Starting Part 1: Transcribe + Translate")
+        
+        # Step 1: Find video (now looks for specific file in Video3-FinalTest)
+        source_key = find_video_file(source_bucket)
+        
+        # Step 2: Start Transcribe
+        transcribe_job_name = start_transcribe_job(source_bucket, source_key)
+        
+        # Step 3: Wait for Transcribe completiowwwn
+        transcribe_response = wait_for_transcribe_completion(transcribe_job_name)
+        
+        # Step 4: Download Vietnamese SRT
+        vietnamese_srt_content = download_srt_working_method(transcribe_response, source_bucket)
+        # Save SRT files into same folder Video3-FinalTest
+        vietnamese_srt_key = 'VietNam/Video3-FinalTest/Video-ren-luyen-su-tu-tin_vietnamese.srt'
+        save_srt_to_s3(source_bucket, vietnamese_srt_key, vietnamese_srt_content)
+        
+        # Step 5: Translate to English
+        english_srt_content = translate_srt_document(vietnamese_srt_content)
+        english_srt_key = 'VietNam/Video3-FinalTest/Video-ren-luyen-su-tu-tin_english.srt'
+        save_srt_to_s3(source_bucket, english_srt_key, english_srt_content)
+        
+        print("✅ Part 1 completed - Now triggering Part 2")
+        
+        # Trigger Part 2 Lambda
+        lambda_client = boto3.client('lambda', region_name='ap-southeast-2')
+        
+        payload = {
+            'source_bucket': source_bucket,
+            'source_key': source_key,
+            'english_srt_key': english_srt_key,
+            'vietnamese_srt_key': vietnamese_srt_key,
+            'transcribe_job': transcribe_job_name
+        }
+        
+        response = lambda_client.invoke(
+            FunctionName='AutoLambdaVideoDACN-Part2',  # Part 2 Lambda
+            InvocationType='Event',  # Async invoke
+            Payload=json.dumps(payload)
+        )
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Part 1 completed successfully!',
+                'status': 'PART_1_DONE',
+                'next_step': 'Part 2 (Audio + Video) is now running asynchronously',
+                'files_created': {
+                    'vietnamese_srt': f's3://{source_bucket}/{vietnamese_srt_key}',
+                    'english_srt': f's3://{source_bucket}/{english_srt_key}'
+                },
+                'part2_triggered': True,
+                'estimated_completion': '10-15 minutes'
+            })
+        }
+        
+    except Exception as e:
+        print(f"❌ Error in Part 1: {str(e)}")
+        import traceback
+        print(f"❌ Traceback: {traceback.format_exc()}")
+        
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': str(e),
+                'error_type': type(e).__name__,
+                'part': 'PART_1_TRANSCRIBE_TRANSLATE'
+            })
+        }
+
+def find_video_file(bucket):
+    """Find the specific video file in VietNam/Video3-FinalTest/"""
+    s3 = boto3.client('s3', region_name='ap-southeast-2')
+    
+    # NEW: point directly to the folder + filename you specified
+    folder = 'VietNam/Video3-FinalTest/'
+    filename = 'Video-ren-luyen-su-tu-tin.mp4'
+    key = folder + filename
+    
+    try:
+        # verify file exists
+        s3.head_object(Bucket=bucket, Key=key)
+        print(f"✅ Video file verified: s3://{bucket}/{key}")
+        return key
+    except Exception as e:
+        raise Exception(f"Video file not found at s3://{bucket}/{key} - {str(e)}")
+
+def start_transcribe_job(bucket, key):
+    """Start Amazon Transcribe job"""
+    transcribe = boto3.client('transcribe', region_name='ap-southeast-2')
+    job_name = f"video3-transcribe-{int(time.time())}"
+    media_uri = f's3://{bucket}/{key}'
+    
+    print(f"🎤 Starting Transcribe job: {job_name}")
+    
+    # OUTPUT KEY changed to the Video3-FinalTest folder so transcribe output lands there
+    response = transcribe.start_transcription_job(
+        TranscriptionJobName=job_name,
+        Media={'MediaFileUri': media_uri},
+        LanguageCode='vi-VN',
+        OutputBucketName=bucket,
+        OutputKey='VietNam/Video3-FinalTest/',
+        Subtitles={'Formats': ['srt'], 'OutputStartIndex': 1}
+    )
+    
+    print(f"✅ Transcribe job started: {job_name}")
+    return job_name
+
+def wait_for_transcribe_completion(job_name):
+    """Wait for Transcribe job completion"""
+    transcribe = boto3.client('transcribe', region_name='ap-southeast-2')
+    print(f"⏳ Waiting for Transcribe job completion: {job_name}")
+    
+    max_wait_time = 1200  # 20 minutes
+    start_time = time.time()
+    
+    while True:
+        response = transcribe.get_transcription_job(TranscriptionJobName=job_name)
+        status = response['TranscriptionJob']['TranscriptionJobStatus']
+        
+        if status == 'COMPLETED':
+            print("✅ Transcribe job completed!")
+            return response
+        elif status == 'FAILED':
+            failure_reason = response['TranscriptionJob'].get('FailureReason', 'Unknown')
+            raise Exception(f"Transcribe job failed: {failure_reason}")
+        else:
+            elapsed_time = time.time() - start_time
+            if elapsed_time > max_wait_time:
+                raise Exception(f"Transcribe job timeout after {max_wait_time} seconds")
+            
+            print(f"⏳ Transcribe status: {status} (elapsed: {int(elapsed_time)}s)")
+            time.sleep(30)
+
+def download_srt_working_method(transcribe_response, expected_bucket):
+    """Download SRT using working method"""
+    s3 = boto3.client('s3', region_name='ap-southeast-2')
+    job_info = transcribe_response['TranscriptionJob']
+    job_name = job_info['TranscriptionJobName']
+    
+    print(f"📥 Downloading SRT for job: {job_name}")
+    
+    # Search in bucket - include the Video3-FinalTest folder
+    search_prefixes = ['VietNam/Video3-FinalTest/', f'VietNam/Video3-FinalTest/{job_name}', f'VietNam/TestVideo2Lambda/{job_name}', job_name, '']
+    
+    for prefix in search_prefixes:
+        try:
+            response = s3.list_objects_v2(Bucket=expected_bucket, Prefix=prefix, MaxKeys=50)
+            
+            if 'Contents' in response:
+                for obj in response['Contents']:
+                    key = obj['Key']
+                    if key.endswith('.srt') and obj['Size'] > 0:
+                        print(f"✅ Found SRT file: s3://{expected_bucket}/{key}")
+                        
+                        file_obj = s3.get_object(Bucket=expected_bucket, Key=key)
+                        content = file_obj['Body'].read().decode('utf-8')
+                        
+                        print(f"✅ Downloaded SRT: {len(content)} characters")
+                        return content
+        except:
+            continue
+    
+    # Try from response URLs
+    if 'Subtitles' in job_info and 'SubtitleFileUris' in job_info['Subtitles']:
+        for uri in job_info['Subtitles']['SubtitleFileUris']:
+            if uri.endswith('.srt'):
+                try:
+                    bucket, key = parse_transcribe_url(uri)
+                    obj = s3.get_object(Bucket=bucket, Key=key)
+                    content = obj['Body'].read().decode('utf-8')
+                    print(f"✅ Downloaded SRT from URI: {len(content)} characters")
+                    return content
+                except:
+                    continue
+    
+    raise Exception("Could not download SRT file")
+
+def parse_transcribe_url(url):
+    """Parse Transcribe HTTPS URL"""
+    if url.startswith('https://s3.') and '.amazonaws.com/' in url:
+        url_parts = url.split('/')
+        if len(url_parts) >= 5:
+            bucket = url_parts[4]
+            key = '/'.join(url_parts[5:]) if len(url_parts) > 5 else ''
+            return bucket, key
+    raise Exception(f"Cannot parse Transcribe URL: {url}")
+
+def save_srt_to_s3(bucket, srt_key, srt_content):
+    """Save SRT file to S3"""
+    s3 = boto3.client('s3', region_name='ap-southeast-2')
+    
+    s3.put_object(
+        Bucket=bucket,
+        Key=srt_key,
+        Body=srt_content.encode('utf-8'),
+        ContentType='text/plain'
+    )
+    
+    print(f"✅ Saved SRT: s3://{bucket}/{srt_key}")
+
+def translate_srt_document(srt_content):
+    """Translate Vietnamese SRT to English"""
+    translate = boto3.client('translate', region_name='ap-southeast-2')
+    print("🔄 Translating Vietnamese SRT to English...")
+    
+    lines = srt_content.split('\n')
+    translated_lines = []
+    
+    for line in lines:
+        line = line.strip()
+        
+        if (line == '' or line.isdigit() or '-->' in line):
+            translated_lines.append(line)
+        else:
+            try:
+                response = translate.translate_text(
+                    Text=line,
+                    SourceLanguageCode='vi',
+                    TargetLanguageCode='en',
+                    Settings={'Brevity': 'ON'}
+                )
+                translated_text = response['TranslatedText']
+                translated_lines.append(translated_text)
+                print(f"🔄 Translated: {line[:30]}... → {translated_text[:30]}...")
+            except Exception as e:
+                print(f"❌ Translation error: {str(e)}")
+                translated_lines.append(line)
+    
+    return '\n'.join(translated_lines)

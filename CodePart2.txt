@@ -1,0 +1,677 @@
+import json
+import boto3
+import time
+import re
+
+def lambda_handler(event, context):
+    """
+    AutoLambdaVideoDACN-Part2 - Tạo video với audio sync
+    """
+    
+    print("🚀 AutoLambdaVideoDACN-Part2 Starting")
+    
+    # S3 paths
+    source_bucket = 'demo-transcribe-s3-1'
+    output_bucket = 'outpuy-demo-transcribe'
+    translated_srt_key = 'VietNam/Video3-FinalTest/Video-ren-luyen-su-tu-tin_english.srt'
+    source_video_key = 'VietNam/Video3-FinalTest/Video-ren-luyen-su-tu-tin.mp4'
+    
+    try:
+        # Step 1: Tạo audio từ SRT
+        print("📝 Creating audio from SRT...")
+        audio_key = create_timing_audio(source_bucket, translated_srt_key, output_bucket)
+        
+        # Step 2: Tạo video cuối cùng
+        print("🎬 Creating final video...")
+        job_id = create_final_video(
+            source_bucket, source_video_key,
+            output_bucket, audio_key,
+            source_bucket, translated_srt_key
+        )
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': '✅ Video processing completed',
+                'audio_file': f's3://{output_bucket}/{audio_key}',
+                'mediaconvert_job': job_id,
+                'output_location': f's3://{output_bucket}/OutputVideo/'
+            })
+        }
+        
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+
+def create_timing_audio(source_bucket, srt_key, output_bucket):
+    """
+    Tạo audio với Polly Long-form Synthesis - LưU TRỰC TIẾP VÀO S3
+    """
+    
+    # Khởi tạo clients
+    s3 = boto3.client('s3', region_name='ap-southeast-2')
+    polly = boto3.client('polly', region_name='ap-southeast-2')
+    
+    print("🎵 Creating audio with Polly Long-form Synthesis...")
+    
+    try:
+        # Đọc SRT file
+        print(f"📖 Reading SRT from: {srt_key}")
+        srt_obj = s3.get_object(Bucket=source_bucket, Key=srt_key)
+        srt_content = srt_obj['Body'].read().decode('utf-8')
+        
+        # Parse SRT
+        subtitles = parse_srt_timing(srt_content)
+        print(f"📝 Parsed {len(subtitles)} subtitle segments")
+        
+        if not subtitles:
+            raise Exception("No subtitles found")
+        
+        # Lấy thời gian bắt đầu của phụ đề đầu tiên
+        first_subtitle_start = subtitles[0]['start_ms']
+        print(f"🕐 First subtitle starts at: {first_subtitle_start}ms ({first_subtitle_start/1000:.1f}s)")
+        
+        # Function để clean text an toàn
+        def clean_text_for_ssml(text):
+            """Clean text để tránh lỗi SSML"""
+            import re
+            
+            # Escape XML characters
+            text = text.replace('&', ' and ')
+            text = text.replace('<', ' ')
+            text = text.replace('>', ' ')
+            text = text.replace('"', ' ')
+            text = text.replace("'", ' ')
+            
+            # Loại bỏ ký tự không phải ASCII
+            text = re.sub(r'[^\x00-\x7F]+', ' ', text)
+            
+            # Loại bỏ ký tự đặc biệt khác
+            text = re.sub(r'[^\w\s.,!?-]', ' ', text)
+            
+            # Loại bỏ khoảng trắng thừa
+            text = ' '.join(text.split())
+            
+            # Giới hạn độ dài cho mỗi segment
+            if len(text) > 200:
+                text = text[:200] + "..."
+            
+            return text.strip()
+        
+        # Tạo SSML đầy đủ (không giới hạn độ dài)
+        ssml_parts = ['<speak>']
+        
+        # BƯỚC 1: Tạo silence đầu
+        if first_subtitle_start > 0:
+            remaining_silence = first_subtitle_start
+            while remaining_silence > 0:
+                silence_chunk = min(remaining_silence, 5000)  # Max 5s per chunk
+                ssml_parts.append(f'<break time="{int(silence_chunk)}ms"/>')
+                remaining_silence -= silence_chunk
+                print(f"   🔇 Added silence: {int(silence_chunk)}ms")
+        
+        # BƯỚC 2: Thêm tất cả phụ đề với logic tốc độ ĐÚNG
+        previous_end = first_subtitle_start
+        
+        for i, subtitle in enumerate(subtitles):
+            start_ms = subtitle['start_ms']
+            end_ms = subtitle['end_ms']
+            text = subtitle['text']
+            
+            # Chuyển đổi thời gian sang giây để dễ hiểu
+            start_seconds = start_ms / 1000.0
+            end_seconds = end_ms / 1000.0
+            
+            print(f"📍 Subtitle {i+1}/{len(subtitles)}: {start_seconds:.1f}s -> {end_seconds:.1f}s")
+            
+            # Clean text
+            clean_text = clean_text_for_ssml(text)
+            
+            # Skip nếu text rỗng
+            if not clean_text or len(clean_text.strip()) < 2:
+                print(f"   ⚠️ Skipped empty text")
+                continue
+            
+            # Tính gap từ phụ đề trước
+            if i > 0:
+                gap = start_ms - previous_end
+                
+                # Điều chỉnh gap dựa trên thời gian (không phải index)
+                if start_seconds > 80:  # Sau 1 phút 20 giây
+                    # Giảm gap mạnh để bù timing drift
+                    reduced_gap = int(gap * 0.2)  # Chỉ giữ 20%
+                elif start_seconds > 45:  # Từ 45 giây đến 1 phút 20
+                    reduced_gap = int(gap * 0.4)  # Giữ 40%
+                elif start_seconds > 22:  # Từ 22 giây đến 45 giây
+                    reduced_gap = int(gap * 0.6)  # Giữ 60%
+                else:  # Trước 22 giây
+                    reduced_gap = int(gap * 0.8)  # Giữ 80%
+                
+                # Thêm break nếu hợp lệ
+                if reduced_gap > 50 and reduced_gap <= 3000:
+                    ssml_parts.append(f'<break time="{reduced_gap}ms"/>')
+                    print(f"   🔇 Gap: {gap}ms -> {reduced_gap}ms")
+            
+            # ✅ XÁC ĐỊNH TỐC ĐỘ DỰA TRÊN THỜI GIAN THỰC TẾ
+            if start_seconds > 80:  # SAU 1 PHÚT 20 GIÂY
+                # Giữ tốc độ BÌNH THƯỜNG để không quá nhanh
+                ssml_parts.append(clean_text)  # Không có prosody = tốc độ bình thường
+                print(f"   🎤 Added with NORMAL rate (after 1m20s)")
+                
+            elif start_seconds > 45:  # TỪ 45 GIÂY ĐẾN 1 PHÚT 20
+                # Tăng tốc VỪA PHẢI
+                ssml_parts.append(f'<prosody rate="medium">{clean_text}</prosody>')
+                print(f"   🎤 Added with MEDIUM rate (45s-1m20s)")
+                
+            elif start_seconds > 22:  # TỪ 22 GIÂY ĐẾN 45 GIÂY
+                # Tăng tốc NHANH để bù timing drift
+                ssml_parts.append(f'<prosody rate="fast">{clean_text}</prosody>')
+                print(f"   ⚡ Added with FAST rate (22s-45s)")
+                
+            else:  # TRƯỚC 22 GIÂY
+                # Tốc độ bình thường
+                ssml_parts.append(clean_text)
+                print(f"   🎤 Added with NORMAL rate (before 22s)")
+            
+            previous_end = end_ms
+        
+        ssml_parts.append('</speak>')
+        final_ssml = ''.join(ssml_parts)
+        
+        print(f"📏 Final SSML length: {len(final_ssml)} characters")
+        print(f"🔍 SSML preview: {final_ssml[:300]}...")
+        
+        # Tạo output path theo yêu cầu
+        output_audio_key = f"OutputAudioMP3/{srt_key.split('/')[-1].replace('.srt', '_audio.mp3')}"
+        
+        print(f"🎯 Output path: s3://{output_bucket}/{output_audio_key}")
+        
+        # Sử dụng StartSpeechSynthesisTask để lưu trực tiếp vào S3
+        print(f"🚀 Starting Polly synthesis task...")
+        
+        try:
+            # Thử neural engine trước
+            task_response = polly.start_speech_synthesis_task(
+                Text=final_ssml,
+                TextType='ssml',
+                OutputFormat='mp3',
+                VoiceId='Joanna',
+                Engine='neural',
+                OutputS3BucketName=output_bucket,
+                OutputS3KeyPrefix=output_audio_key.rsplit('.', 1)[0]  # Bỏ .mp3 vì Polly tự thêm
+            )
+            print("✅ Started synthesis task with neural engine")
+            
+        except Exception as neural_error:
+            print(f"⚠️ Neural engine failed: {str(neural_error)}")
+            
+            # Fallback sang standard engine
+            task_response = polly.start_speech_synthesis_task(
+                Text=final_ssml,
+                TextType='ssml',
+                OutputFormat='mp3',
+                VoiceId='Joanna',
+                Engine='standard',
+                OutputS3BucketName=output_bucket,
+                OutputS3KeyPrefix=output_audio_key.rsplit('.', 1)[0]  # Bỏ .mp3
+            )
+            print("✅ Started synthesis task with standard engine")
+        
+        task_id = task_response['SynthesisTask']['TaskId']
+        print(f"📋 Task ID: {task_id}")
+        
+        # Chờ task hoàn thành
+        import time
+        max_wait_time = 300  # 5 phút
+        wait_interval = 10   # 10 giây
+        elapsed_time = 0
+        
+        print(f"⏳ Waiting for synthesis task to complete...")
+        
+        while elapsed_time < max_wait_time:
+            # Kiểm tra trạng thái task
+            task_status = polly.get_speech_synthesis_task(TaskId=task_id)
+            status = task_status['SynthesisTask']['TaskStatus']
+            
+            print(f"   📊 Task status: {status} (waited {elapsed_time}s)")
+            
+            if status == 'completed':
+                output_uri = task_status['SynthesisTask']['OutputUri']
+                print(f"✅ Synthesis completed!")
+                print(f"🎵 Audio available at: {output_uri}")
+                
+                # Extract final S3 key từ output URI
+                final_s3_key = output_uri.split(f"{output_bucket}/")[-1]
+                print(f"📁 Final S3 key: {final_s3_key}")
+                
+                return final_s3_key
+                
+            elif status == 'failed':
+                failure_reason = task_status['SynthesisTask'].get('TaskStatusReason', 'Unknown error')
+                raise Exception(f"Synthesis task failed: {failure_reason}")
+            
+            # Chờ trước khi kiểm tra lại
+            time.sleep(wait_interval)
+            elapsed_time += wait_interval
+        
+        # Timeout
+        raise Exception(f"Synthesis task timeout after {max_wait_time} seconds")
+        
+    except Exception as e:
+        print(f"❌ Error in create_timing_audio: {str(e)}")
+        raise e
+
+def parse_srt_timing(srt_content):
+    """
+    Parse SRT với timing chính xác
+    """
+    
+    print("📊 Parsing SRT timing...")
+    
+    blocks = re.split(r'\n\s*\n', srt_content.strip())
+    subtitles = []
+    
+    for block in blocks:
+        lines = block.strip().split('\n')
+        if len(lines) >= 3:
+            timing_line = lines[1]
+            text_lines = lines[2:]
+            
+            # Parse timing: 00:00:09,859 --> 00:00:12,720
+            match = re.match(r'(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})', timing_line)
+            
+            if match:
+                # Start time
+                sh, sm, ss, sms = map(int, match.groups()[:4])
+                start_ms = (sh * 3600 + sm * 60 + ss) * 1000 + sms
+                
+                # End time
+                eh, em, es, ems = map(int, match.groups()[4:])
+                end_ms = (eh * 3600 + em * 60 + es) * 1000 + ems
+                
+                # Clean text
+                text = ' '.join(text_lines).strip()
+                text = clean_text_for_polly(text)
+                
+                if text:
+                    subtitles.append({
+                        'start_ms': start_ms,
+                        'end_ms': end_ms,
+                        'text': text,
+                        'duration_ms': end_ms - start_ms
+                    })
+    
+    print(f"✅ Parsed {len(subtitles)} subtitles")
+    
+    # Show timing info
+    if subtitles:
+        total_duration = subtitles[-1]['end_ms'] / 1000.0
+        print(f"📊 Total duration: {total_duration:.1f}s")
+        
+        # Show first few
+        for i, sub in enumerate(subtitles[:3]):
+            print(f"   {i+1}: {sub['start_ms']/1000:.1f}s - '{sub['text'][:40]}...'")
+    
+    return subtitles
+
+def clean_text_for_polly(text):
+    """
+    Clean text cho Polly
+    """
+    
+    # Remove HTML tags
+    text = re.sub(r'<[^>]+>', '', text)
+    
+    # Replace special chars
+    replacements = {
+        '&': 'and',
+        '<': '',
+        '>': '',
+        '"': "'",
+        '"': "'",
+        '"': "'",
+        ''': "'",
+        ''': "'",
+        '–': '-',
+        '—': '-'
+    }
+    
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    
+    # Keep safe ASCII
+    text = ''.join(c for c in text if 32 <= ord(c) <= 126)
+    
+    # Normalize spaces
+    text = ' '.join(text.split())
+    
+    return text.strip()
+
+def create_sync_ssml(subtitles):
+    """
+    Tạo SSML với silence tuyệt đối - CÁCH MẠNH NHẤT
+    """
+    ssml_parts = ['<speak>']
+    
+    print(f"🎵 Creating SSML with absolute silence positioning...")
+    
+    for i, subtitle in enumerate(subtitles):
+        start_ms = subtitle['start_ms']
+        text = subtitle['text']
+        
+        print(f"📍 Segment {i+1}: Absolute position at {start_ms}ms")
+        
+        if i == 0:
+            # Segment đầu tiên: tạo silence từ 0 đến start_ms
+            if start_ms > 0:
+                # Tạo silence bằng cách lặp lại ký tự im lặng
+                silence_duration_sec = start_ms / 1000.0
+                silence_text = "." * int(silence_duration_sec * 2)  # 2 dots per second
+                ssml_parts.append(f'<prosody rate="x-slow" volume="silent">{silence_text}</prosody>')
+                ssml_parts.append(f'<break time="{start_ms}ms"/>')
+                print(f"   🔇 Created absolute silence: {start_ms}ms")
+        else:
+            # Tính gap từ segment trước
+            prev_end = subtitles[i-1]['end_ms']
+            gap = start_ms - prev_end
+            
+            if gap > 100:
+                # Tạo silence cho gap
+                gap_silence_sec = gap / 1000.0
+                gap_silence_text = "." * max(1, int(gap_silence_sec))
+                ssml_parts.append(f'<prosody rate="x-slow" volume="silent">{gap_silence_text}</prosody>')
+                ssml_parts.append(f'<break time="{gap}ms"/>')
+                print(f"   🔇 Created gap silence: {gap}ms")
+        
+        # Escape và thêm text
+        safe_text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        ssml_parts.append(safe_text)
+        
+        print(f"   ✅ Added text at position {start_ms}ms")
+    
+    ssml_parts.append('</speak>')
+    final_ssml = ''.join(ssml_parts)
+    
+    print(f"🎵 Created SSML with absolute positioning")
+    
+    return final_ssml
+
+def find_existing_audio(s3, output_bucket):
+    """
+    Tìm audio có sẵn
+    """
+    
+    try:
+        response = s3.list_objects_v2(
+            Bucket=output_bucket,
+            Prefix='OutputAudioMP3/',
+            MaxKeys=50
+        )
+        
+        if 'Contents' in response:
+            # Sort by size (bigger = better)
+            sorted_files = sorted(response['Contents'], 
+                                key=lambda x: x['Size'], 
+                                reverse=True)
+            
+            for obj in sorted_files:
+                if (obj['Key'].endswith('.mp3') and 
+                    obj['Size'] > 2000000):  # At least 2MB
+                    
+                    print(f"✅ Found existing audio: {obj['Key']} ({obj['Size']} bytes)")
+                    return obj['Key']
+    
+    except Exception as e:
+        print(f"⚠️ Error finding existing audio: {str(e)}")
+    
+    return None
+
+def submit_polly_job(polly, ssml_content, output_bucket):
+    """
+    Submit Polly job
+    """
+    
+    print("🎵 Submitting Polly job...")
+    
+    # Choose engine
+    if len(ssml_content) > 100000:
+        engine = 'standard'
+        sample_rate = '22050'
+    else:
+        engine = 'neural'
+        sample_rate = '24000'
+    
+    timestamp = int(time.time())
+    prefix = f'OutputAudioMP3/confidence_{timestamp}_'
+    
+    try:
+        response = polly.start_speech_synthesis_task(
+            TextType='ssml',
+            Text=ssml_content,
+            OutputFormat='mp3',
+            VoiceId='Joanna',
+            Engine=engine,
+            OutputS3BucketName=output_bucket,
+            OutputS3KeyPrefix=prefix,
+            SampleRate=sample_rate
+        )
+        
+        task_id = response['SynthesisTask']['TaskId']
+        print(f"✅ Polly job: {task_id} ({engine} engine)")
+        
+        return task_id
+        
+    except Exception as e:
+        if engine == 'neural':
+            print(f"⚠️ Neural failed, trying Standard: {str(e)}")
+            
+            response = polly.start_speech_synthesis_task(
+                TextType='ssml',
+                Text=ssml_content,
+                OutputFormat='mp3',
+                VoiceId='Joanna',
+                Engine='standard',
+                OutputS3BucketName=output_bucket,
+                OutputS3KeyPrefix=f'OutputAudioMP3/confidence_std_{timestamp}_',
+                SampleRate='22050'
+            )
+            
+            task_id = response['SynthesisTask']['TaskId']
+            print(f"✅ Standard job: {task_id}")
+            return task_id
+        else:
+            raise Exception(f"Polly failed: {str(e)}")
+
+def wait_for_audio(polly, s3, task_id, output_bucket):
+    """
+    Chờ audio hoàn thành
+    """
+    
+    print(f"⏳ Waiting for audio: {task_id}")
+    
+    # Possible keys
+    timestamp = int(time.time())
+    possible_keys = [
+        f"OutputAudioMP3/confidence_{timestamp}_{task_id}.mp3",
+        f"OutputAudioMP3/confidence_{timestamp-1}_{task_id}.mp3",
+        f"OutputAudioMP3/confidence_std_{timestamp}_{task_id}.mp3"
+    ]
+    
+    max_wait = 300  # 5 minutes
+    interval = 15
+    
+    for attempt in range(max_wait // interval):
+        try:
+            task_response = polly.get_speech_synthesis_task(TaskId=task_id)
+            status = task_response['SynthesisTask']['TaskStatus']
+            
+            print(f"⏳ [{attempt*interval}s] Status: {status}")
+            
+            if status == 'completed':
+                print("🎉 Audio completed!")
+                
+                # Wait for S3
+                time.sleep(3)
+                
+                # Check for audio
+                for audio_key in possible_keys:
+                    try:
+                        head_response = s3.head_object(Bucket=output_bucket, Key=audio_key)
+                        file_size = head_response['ContentLength']
+                        
+                        print(f"✅ Audio ready: {audio_key} ({file_size} bytes)")
+                        
+                        if file_size > 500000:  # At least 500KB
+                            return audio_key
+                            
+                    except s3.exceptions.NoSuchKey:
+                        continue
+                
+                # Search for any audio with task_id
+                try:
+                    response = s3.list_objects_v2(
+                        Bucket=output_bucket,
+                        Prefix='OutputAudioMP3/'
+                    )
+                    
+                    if 'Contents' in response:
+                        for obj in response['Contents']:
+                            if (task_id in obj['Key'] and 
+                                obj['Key'].endswith('.mp3') and
+                                obj['Size'] > 500000):
+                                
+                                print(f"✅ Found audio: {obj['Key']}")
+                                return obj['Key']
+                
+                except Exception as e:
+                    print(f"⚠️ Search error: {str(e)}")
+                
+            elif status == 'failed':
+                reason = task_response['SynthesisTask'].get('TaskStatusReason', 'Unknown')
+                raise Exception(f"Audio failed: {reason}")
+            
+        except Exception as e:
+            print(f"⚠️ Error checking audio: {str(e)}")
+        
+        time.sleep(interval)
+    
+    raise Exception(f"Audio timeout: {task_id}")
+
+def create_final_video(source_bucket, source_video_key, output_bucket, audio_key, captions_bucket, captions_key):
+    """
+    Tạo video cuối cùng với MediaConvert
+    """
+    
+    mediaconvert = boto3.client('mediaconvert', 
+                               region_name='ap-southeast-2',
+                               endpoint_url='https://mediaconvert.ap-southeast-2.amazonaws.com')
+    
+    print("🎬 Creating final video:")
+    print(f"   Video: s3://{source_bucket}/{source_video_key}")
+    print(f"   Audio: s3://{output_bucket}/{audio_key}")
+    print(f"   Captions: s3://{captions_bucket}/{captions_key}")
+    
+    # Verify audio exists
+    s3 = boto3.client('s3', region_name='ap-southeast-2')
+    try:
+        head_response = s3.head_object(Bucket=output_bucket, Key=audio_key)
+        print(f"✅ Audio verified: {head_response['ContentLength']} bytes")
+    except Exception as e:
+        raise Exception(f"Audio verification failed: {str(e)}")
+    
+    job_settings = {
+        "Role": "arn:aws:iam::463735866257:role/service-role/cuong-role-4qfr900b",
+        "Settings": {
+            "Inputs": [
+                {
+                    "FileInput": f"s3://{source_bucket}/{source_video_key}",
+                    "AudioSelectors": {
+                        "Audio Selector 1": {
+                            "DefaultSelection": "NOT_DEFAULT",
+                            "ExternalAudioFileInput": f"s3://{output_bucket}/{audio_key}"
+                        }
+                    },
+                    "CaptionSelectors": {
+                        "Captions Selector 1": {
+                            "SourceSettings": {
+                                "SourceType": "SRT",
+                                "FileSourceSettings": {
+                                    "SourceFile": f"s3://{captions_bucket}/{captions_key}"
+                                }
+                            }
+                        }
+                    }
+                }
+            ],
+            "OutputGroups": [{
+                "OutputGroupSettings": {
+                    "Type": "FILE_GROUP_SETTINGS",
+                    "FileGroupSettings": {
+                        "Destination": f"s3://{output_bucket}/OutputVideo/"
+                    }
+                },
+                "Outputs": [{
+                    "NameModifier": "_FINAL",
+                    "VideoDescription": {
+                        "CodecSettings": {
+                            "Codec": "H_264",
+                            "H264Settings": {
+                                "RateControlMode": "QVBR",
+                                "MaxBitrate": 5000000,
+                                "QvbrSettings": {
+                                    "QvbrQualityLevel": 7
+                                },
+                                "QualityTuningLevel": "SINGLE_PASS",
+                                "FramerateControl": "INITIALIZE_FROM_SOURCE"
+                            }
+                        }
+                    },
+                    "AudioDescriptions": [{
+                        "AudioSourceName": "Audio Selector 1",
+                        "CodecSettings": {
+                            "Codec": "AAC",
+                            "AacSettings": {
+                                "Bitrate": 128000,
+                                "RateControlMode": "CBR",
+                                "CodingMode": "CODING_MODE_2_0",
+                                "SampleRate": 48000,
+                                "Specification": "MPEG4"
+                            }
+                        }
+                    }],
+                    "CaptionDescriptions": [{
+                        "CaptionSelectorName": "Captions Selector 1",
+                        "DestinationSettings": {
+                            "DestinationType": "BURN_IN",
+                            "BurninDestinationSettings": {
+                                "Alignment": "CENTERED",
+                                "BackgroundColor": "BLACK",
+                                "BackgroundOpacity": 160,
+                                "FontColor": "WHITE",
+                                "FontOpacity": 255,
+                                "FontSize": 16,
+                                "OutlineColor": "BLACK",
+                                "OutlineSize": 2
+                            }
+                        }
+                    }],
+                    "ContainerSettings": {
+                        "Container": "MP4"
+                    }
+                }]
+            }]
+        }
+    }
+    
+    try:
+        response = mediaconvert.create_job(**job_settings)
+        job_id = response['Job']['Id']
+        
+        print(f"✅ MediaConvert job: {job_id}")
+        
+        return job_id
+        
+    except Exception as e:
+        raise Exception(f"MediaConvert failed: {str(e)}")
